@@ -1,0 +1,124 @@
+CREATE OR REPLACE TABLE FUNCTION `pulse-dev-477810.KPIs.k_hr_project_attrition`(
+    p_gender STRING,
+    p_function STRING,
+    p_department STRING,
+    p_designation STRING,
+    p_location STRING,
+    p_employment_status STRING
+)
+AS (
+WITH base AS (
+    SELECT
+        fe.emp_id AS employee_id,
+        pj.project_name,
+        pj.project_id,
+        CAST(fe.project_start_date AS DATE) AS p_start,
+        CAST(COALESCE(fe.project_end_date, CURRENT_DATE()) AS DATE) AS p_end,
+        CAST(fe.emp_resigned_date AS DATE) AS res_date,
+        g.gender_type,
+        fn.function_name AS Function_Name,
+        d.department_name,
+        ds.designation_name,
+        l.location_name,
+        es.employment_status
+    FROM `pulse-dev-477810.gold.g_hr_fact_emp` fe
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_project` pj ON fe.project_id = pj.project_id
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_gender` g ON fe.gender_id = g.gender_id
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_functions` fn ON fe.function_id = fn.function_id
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_department` d ON fe.department_id = d.department_id
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_designation` ds ON fe.designation_id = ds.designation_id
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_location` l ON fe.location_id = l.location_id
+    LEFT JOIN `pulse-dev-477810.gold.g_hr_dim_employment_status` es ON fe.employment_status_id = es.employment_status_id
+    WHERE pj.project_id != 0
+),
+
+filtered AS (
+    SELECT * FROM base
+    WHERE (p_gender = 'All' OR gender_type = p_gender)
+      AND (p_function = 'All' OR Function_Name = p_function)
+      AND (p_department = 'All' OR department_name = p_department)
+      AND (p_designation = 'All' OR designation_name = p_designation)
+      AND (p_location = 'All' OR location_name = p_location)
+      AND (p_employment_status = 'All' OR employment_status = p_employment_status)
+),
+
+calendar_grid AS (
+    SELECT 
+        c.fiscal_year, c.quarter_name, c.calendar_month_name,
+        MIN(c.calendar_date) as m_start,
+        MAX(c.calendar_date) as m_end
+    FROM `pulse-dev-477810.gold.g_hr_dim_calendar` c
+    GROUP BY 1, 2, 3
+),
+
+-- Step 1: Calculate Monthly Components
+monthly_metrics AS (
+    SELECT
+        f.project_name,
+        cg.fiscal_year, cg.quarter_name, cg.calendar_month_name,
+        cg.m_start, cg.m_end,
+        COUNT(DISTINCT CASE WHEN f.res_date BETWEEN cg.m_start AND cg.m_end 
+                             AND f.res_date BETWEEN f.p_start AND f.p_end 
+                            THEN f.employee_id END) AS Month_Exits,
+        COUNT(DISTINCT CASE WHEN cg.m_start BETWEEN f.p_start AND f.p_end THEN f.employee_id END) AS Start_HC,
+        COUNT(DISTINCT CASE WHEN cg.m_end BETWEEN f.p_start AND f.p_end THEN f.employee_id END) AS End_HC
+    FROM filtered f
+    CROSS JOIN calendar_grid cg
+    WHERE (f.p_start <= cg.m_end AND f.p_end >= cg.m_start)
+    GROUP BY 1, 2, 3, 4, 5, 6
+),
+
+-- Step 2: Aggregate for Quarter Attrition
+quarterly_aggregates AS (
+    SELECT 
+        project_name, fiscal_year, quarter_name,
+        SUM(Month_Exits) as Q_Exits,
+        -- Get the Start HC from the first month of the quarter and End HC from the last
+        ARRAY_AGG(Start_HC ORDER BY m_start ASC LIMIT 1)[OFFSET(0)] as Q_Start_HC,
+        ARRAY_AGG(End_HC ORDER BY m_start DESC LIMIT 1)[OFFSET(0)] as Q_End_HC
+    FROM monthly_metrics
+    GROUP BY 1, 2, 3
+),
+
+-- Step 3: Aggregate for FY Attrition
+fy_aggregates AS (
+    SELECT 
+        project_name, fiscal_year,
+        SUM(Month_Exits) as FY_Exits,
+        ARRAY_AGG(Start_HC ORDER BY m_start ASC LIMIT 1)[OFFSET(0)] as FY_Start_HC,
+        ARRAY_AGG(End_HC ORDER BY m_start DESC LIMIT 1)[OFFSET(0)] as FY_End_HC
+    FROM monthly_metrics
+    GROUP BY 1, 2
+)
+
+-- Step 4: Final Selection joining all levels
+SELECT
+    m.project_name,
+    m.m_start AS Start_Date,
+    m.m_end AS End_Date,
+    m.fiscal_year AS FY,
+    m.quarter_name AS Quarter,
+    m.calendar_month_name AS Month_Name,
+    
+    -- FY Attrition Calculation
+    ROUND(SAFE_DIVIDE(CAST(fya.FY_Exits AS FLOAT64), (fya.FY_Start_HC + fya.FY_End_HC) / 2.0), 4) AS FY_Attrition,
+    
+    -- Quarter Attrition Calculation
+    ROUND(SAFE_DIVIDE(CAST(qa.Q_Exits AS FLOAT64), (qa.Q_Start_HC + qa.Q_End_HC) / 2.0), 4) AS Quarter_Attrition,
+    
+    -- Monthly Attrition Calculation
+    ROUND(SAFE_DIVIDE(CAST(m.Month_Exits AS FLOAT64), (m.Start_HC + m.End_HC) / 2.0), 4) AS Month_Attrition,
+    
+    m.Month_Exits AS Numerator_Count,
+    (m.Start_HC + m.End_HC) / 2.0 AS Denominator_Count,
+    ROUND(SAFE_DIVIDE(CAST(m.Month_Exits AS FLOAT64), (m.Start_HC + m.End_HC) / 2.0), 4) AS Attrition_Pct,
+    
+    p_gender AS gender_type, p_function AS Function_Name, p_department AS department_name, 
+    p_designation AS designation_name, p_location AS location_name, p_employment_status AS employment_status
+FROM monthly_metrics m
+LEFT JOIN quarterly_aggregates qa 
+    ON m.project_name = qa.project_name AND m.fiscal_year = qa.fiscal_year AND m.quarter_name = qa.quarter_name
+LEFT JOIN fy_aggregates fya 
+    ON m.project_name = fya.project_name AND m.fiscal_year = fya.fiscal_year
+WHERE (m.Start_HC + m.End_HC) > 0
+);
